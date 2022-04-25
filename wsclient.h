@@ -79,19 +79,19 @@ typedef struct _wsclient_frame {
 	struct _wsclient_frame *next_frame;
 	struct _wsclient_frame *prev_frame;
 	unsigned char mask[4];
-} wsclient_frame;
+} __wsclient_frame_t;
 
 typedef struct _wsclient_message {
 	unsigned int opcode;
 	unsigned long long payload_len;
 	char *payload;
-} wsclient_message;
+} __wsclient_message_t;
 
 typedef struct _wsclient_error {
 	int code;
 	int extra_code;
 	char *str;
-} wsclient_error;
+} __wsclient_error_t;
 
 typedef struct _wsclient {
 	pthread_t helper_thread;
@@ -104,64 +104,45 @@ typedef struct _wsclient {
 	int flags;
 	int (*onopen)(struct _wsclient *);
 	int (*onclose)(struct _wsclient *);
-	int (*onerror)(struct _wsclient *, wsclient_error *err);
-	int (*onmessage)(struct _wsclient *, wsclient_message *msg);
-	wsclient_frame *current_frame;
+	int (*onerror)(struct _wsclient *, __wsclient_error_t *err);
+	int (*onmessage)(struct _wsclient *, __wsclient_message_t *msg);
+	__wsclient_frame_t *current_frame;
 	struct sockaddr_un helper_sa;
 	int helper_sock;
+	void *ref_struct;
 #ifdef HAVE_LIBSSL
 	SSL_CTX *ssl_ctx;
 	SSL *ssl;
 #endif
-} wsclient;
+} __wsclient_t;
 
+int base64_encode(unsigned char *source, size_t sourcelen, char *target, size_t targetlen);
+int libwsclient_send(__wsclient_t *client, char *strdata, int opcode);
+void libwsclient_onclose(__wsclient_t *client, int (*cb)(__wsclient_t *c));
+void libwsclient_onopen(__wsclient_t *client, int (*cb)(__wsclient_t *c));
+void libwsclient_onmessage(__wsclient_t *client, int (*cb)(__wsclient_t *c, __wsclient_message_t *msg));
+void libwsclient_onerror(__wsclient_t *client, int (*cb)(__wsclient_t *c, __wsclient_error_t *err));
+int libwsclient_send_fragment(__wsclient_t *client, char *strdata, int len, int flags);
 
 //Function defs
 
-wsclient *libwsclient_new(const char *URI);
-wsclient_error *libwsclient_new_error(int errcode);
-ssize_t _libwsclient_read(wsclient *c, void *buf, size_t length);
-ssize_t _libwsclient_write(wsclient *c, const void *buf, size_t length);
+__wsclient_t *libwsclient_new(const char *URI);
+__wsclient_error_t *libwsclient_new_error(int errcode);
+ssize_t _libwsclient_read(__wsclient_t *c, void *buf, size_t length);
+ssize_t _libwsclient_write(__wsclient_t *c, const void *buf, size_t length);
 int libwsclient_open_connection(const char *host, const char *port);
 int stricmp(const char *s1, const char *s2);
-int libwsclient_complete_frame(wsclient *c, wsclient_frame *frame);
-void libwsclient_handle_control_frame(wsclient *c, wsclient_frame *ctl_frame);
-void libwsclient_run(wsclient *c);
-void libwsclient_finish(wsclient *client);
+int libwsclient_complete_frame(__wsclient_t *c, __wsclient_frame_t *frame);
+void libwsclient_handle_control_frame(__wsclient_t *c, __wsclient_frame_t *ctl_frame);
+void libwsclient_run(__wsclient_t *c);
+void libwsclient_finish(__wsclient_t *client);
 void *libwsclient_run_thread(void *ptr);
 void *libwsclient_handshake_thread(void *ptr);
-void libwsclient_cleanup_frames(wsclient_frame *first);
-void libwsclient_in_data(wsclient *c, char in);
-void libwsclient_dispatch_message(wsclient *c, wsclient_frame *current);
-void libwsclient_close(wsclient *c);
-int libwsclient_helper_socket(wsclient *c, const char *path);
+void libwsclient_cleanup_frames(__wsclient_frame_t *first);
+void libwsclient_in_data(__wsclient_t *c, char in);
+void libwsclient_dispatch_message(__wsclient_t *c, __wsclient_frame_t *current);
+void libwsclient_close(__wsclient_t *c);
+int libwsclient_helper_socket(__wsclient_t *c, const char *path);
 void *libwsclient_helper_socket_thread(void *ptr);
-
-//Define errors
-char *errors[] = {
-		"Unknown error occured",
-		"Error while getting address info",
-		"Could connect to any address returned by getaddrinfo",
-		"Error receiving data in client run thread",
-		"Error during libwsclient_close",
-		"Error sending while handling control frame",
-		"Received masked frame from server",
-		"Got null pointer during message dispatch",
-		"Attempted to send after close frame was sent",
-		"Attempted to send during connect",
-		"Attempted to send null payload",
-		"Attempted to send too much data",
-		"Error during send in libwsclient_send",
-		"Remote end closed connection during handshake",
-		"Problem receiving data during handshake",
-		"Remote web server responded with bad HTTP status during handshake",
-		"Remote web server did not respond with upgrade header during handshake",
-		"Remote web server did not respond with connection header during handshake",
-		"Remote web server did not specify the appropriate Sec-WebSocket-Accept header during handshake",
-		NULL
-};
-
-int libwsclient_flags; //global flags variable
-
 
 #endif /* WSCLIENT_H_ */

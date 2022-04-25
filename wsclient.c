@@ -19,8 +19,34 @@
 #include "config.h"
 #include "sha1.h"
 
+//Define errors
+char *errors[] = {
+		"Unknown error occured",
+		"Error while getting address info",
+		"Could connect to any address returned by getaddrinfo",
+		"Error receiving data in client run thread",
+		"Error during libwsclient_close",
+		"Error sending while handling control frame",
+		"Received masked frame from server",
+		"Got null pointer during message dispatch",
+		"Attempted to send after close frame was sent",
+		"Attempted to send during connect",
+		"Attempted to send null payload",
+		"Attempted to send too much data",
+		"Error during send in libwsclient_send",
+		"Remote end closed connection during handshake",
+		"Problem receiving data during handshake",
+		"Remote web server responded with bad HTTP status during handshake",
+		"Remote web server did not respond with upgrade header during handshake",
+		"Remote web server did not respond with connection header during handshake",
+		"Remote web server did not specify the appropriate Sec-WebSocket-Accept header during handshake",
+		NULL
+};
 
-void libwsclient_run(wsclient *c) {
+int libwsclient_flags; //global flags variable
+
+
+void libwsclient_run(__wsclient_t *c) {
 	if(c->flags & CLIENT_CONNECTING) {
 		pthread_join(c->handshake_thread, NULL);
 		pthread_mutex_lock(&c->lock);
@@ -35,8 +61,8 @@ void libwsclient_run(wsclient *c) {
 }
 
 void *libwsclient_run_thread(void *ptr) {
-	wsclient *c = (wsclient *)ptr;
-	wsclient_error *err = NULL;
+	__wsclient_t *c = (__wsclient_t *)ptr;
+	__wsclient_error_t *err = NULL;
 	int sockfd;
 	char buf[1024];
 	int n, i;
@@ -62,12 +88,29 @@ void *libwsclient_run_thread(void *ptr) {
 	if(c->onclose) {
 		c->onclose(c);
 	}
+
+   	if(c->flags & CLIENT_IS_SSL) {
+		SSL_shutdown(c->ssl);
+		SSL_free(c->ssl);
+		SSL_CTX_free(c->ssl_ctx);
+	}
+
 	close(c->sockfd);
+
+	if (c->URI) {
+		free(c->URI);
+		c->URI = NULL;
+	}
+	libwsclient_cleanup_frames(c->current_frame);
+
+	pthread_mutex_destroy(&c->lock);
+    pthread_mutex_destroy(&c->send_lock);
+
 	free(c);
 	return NULL;
 }
 
-void libwsclient_finish(wsclient *client) {
+void libwsclient_finish(__wsclient_t *client) {
 	//TODO: handle UNIX socket helper thread shutdown better than killing it...  :P
 	if(client->helper_thread) {
 		pthread_kill(client->helper_thread, SIGINT);
@@ -78,32 +121,32 @@ void libwsclient_finish(wsclient *client) {
 
 }
 
-void libwsclient_onclose(wsclient *client, int (*cb)(wsclient *c)) {
+void libwsclient_onclose(__wsclient_t *client, int (*cb)(__wsclient_t *c)) {
 	pthread_mutex_lock(&client->lock);
 	client->onclose = cb;
 	pthread_mutex_unlock(&client->lock);
 }
 
-void libwsclient_onopen(wsclient *client, int (*cb)(wsclient *c)) {
+void libwsclient_onopen(__wsclient_t *client, int (*cb)(__wsclient_t *c)) {
 	pthread_mutex_lock(&client->lock);
 	client->onopen = cb;
 	pthread_mutex_unlock(&client->lock);
 }
 
-void libwsclient_onmessage(wsclient *client, int (*cb)(wsclient *c, wsclient_message *msg)) {
+void libwsclient_onmessage(__wsclient_t *client, int (*cb)(__wsclient_t *c, __wsclient_message_t *msg)) {
 	pthread_mutex_lock(&client->lock);
 	client->onmessage = cb;
 	pthread_mutex_unlock(&client->lock);
 }
 
-void libwsclient_onerror(wsclient *client, int (*cb)(wsclient *c, wsclient_error *err)) {
+void libwsclient_onerror(__wsclient_t *client, int (*cb)(__wsclient_t *c, __wsclient_error_t *err)) {
 	pthread_mutex_lock(&client->lock);
 	client->onerror = cb;
 	pthread_mutex_unlock(&client->lock);
 }
 
-void libwsclient_close(wsclient *client) {
-	wsclient_error *err = NULL;
+void libwsclient_close(__wsclient_t *client) {
+	__wsclient_error_t *err = NULL;
 	char data[6];
 	int i = 0, n, mask_int;
 	struct timeval tv;
@@ -134,9 +177,9 @@ void libwsclient_close(wsclient *client) {
 	pthread_mutex_unlock(&client->lock);
 }
 
-void libwsclient_handle_control_frame(wsclient *c, wsclient_frame *ctl_frame) {
-	wsclient_error *err = NULL;
-	wsclient_frame *ptr = NULL;
+void libwsclient_handle_control_frame(__wsclient_t *c, __wsclient_frame_t *ctl_frame) {
+	__wsclient_error_t *err = NULL;
+	__wsclient_frame_t *ptr = NULL;
 	int i, n = 0;
 	char mask[4];
 	int mask_int;
@@ -148,6 +191,7 @@ void libwsclient_handle_control_frame(wsclient *c, wsclient_frame *ctl_frame) {
 	pthread_mutex_lock(&c->lock);
 	switch(ctl_frame->opcode) {
 		case 0x8:
+			fprintf(stdout, "[waka] : control_frame case 0x8: (server send close control frame) \n");
 			//close frame
 			if((c->flags & CLIENT_SENT_CLOSE_FRAME) == 0) {
 				//server request close.  Send close frame as acknowledgement.
@@ -173,6 +217,21 @@ void libwsclient_handle_control_frame(wsclient *c, wsclient_frame *ctl_frame) {
 			}
 			c->flags |= CLIENT_SHOULD_CLOSE;
 			break;
+		case 0x9:
+			fprintf(stdout, "[waka] : control_frame case 0x9: (server send [ping] control frame)\n");
+			int n = libwsclient_send(c, ctl_frame->rawdata, 0xA);
+			if(n=0x00) {
+				err = libwsclient_new_error(WS_HANDLE_CTL_FRAME_SEND_ERR);
+				err->extra_code = n;
+				c->onerror(c, err);
+				free(err);
+				err = NULL;
+			}
+			fprintf(stdout, "[waka] : control_frame case 0x9: (client send [pong] control frame)\n");
+			break;
+		case 0xA:
+			fprintf(stdout, "[waka] : control_frame case 0xA: [unexpected] (server send pong control frame)\n");
+			break;
 		default:
 			fprintf(stderr, "Unhandled control frame received.  Opcode: %d\n", ctl_frame->opcode);
 			break;
@@ -180,20 +239,20 @@ void libwsclient_handle_control_frame(wsclient *c, wsclient_frame *ctl_frame) {
 
 	ptr = ctl_frame->prev_frame; //This very well may be a NULL pointer, but just in case we preserve it.
 	free(ctl_frame->rawdata);
-	memset(ctl_frame, 0, sizeof(wsclient_frame));
+	memset(ctl_frame, 0, sizeof(__wsclient_frame_t));
 	ctl_frame->prev_frame = ptr;
 	ctl_frame->rawdata = (char *)malloc(FRAME_CHUNK_LENGTH);
 	memset(ctl_frame->rawdata, 0, FRAME_CHUNK_LENGTH);
 	pthread_mutex_unlock(&c->lock);
 }
 
-inline void libwsclient_in_data(wsclient *c, char in) {
-	wsclient_frame *current = NULL, *new = NULL;
+inline void libwsclient_in_data(__wsclient_t *c, char in) {
+	__wsclient_frame_t *current = NULL, *new = NULL;
 	unsigned char payload_len_short;
 	pthread_mutex_lock(&c->lock);
 	if(c->current_frame == NULL) {
-		c->current_frame = (wsclient_frame *)malloc(sizeof(wsclient_frame));
-		memset(c->current_frame, 0, sizeof(wsclient_frame));
+		c->current_frame = (__wsclient_frame_t *)malloc(sizeof(__wsclient_frame_t));
+		memset(c->current_frame, 0, sizeof(__wsclient_frame_t));
 		c->current_frame->payload_len = -1;
 		c->current_frame->rawdata_sz = FRAME_CHUNK_LENGTH;
 		c->current_frame->rawdata = (char *)malloc(c->current_frame->rawdata_sz);
@@ -217,8 +276,8 @@ inline void libwsclient_in_data(wsclient *c, char in) {
 				c->current_frame = NULL;
 			}
 		} else {
-			new = (wsclient_frame *)malloc(sizeof(wsclient_frame));
-			memset(new, 0, sizeof(wsclient_frame));
+			new = (__wsclient_frame_t *)malloc(sizeof(__wsclient_frame_t));
+			memset(new, 0, sizeof(__wsclient_frame_t));
 			new->payload_len = -1;
 			new->rawdata = (char *)malloc(FRAME_CHUNK_LENGTH);
 			memset(new->rawdata, 0, FRAME_CHUNK_LENGTH);
@@ -229,13 +288,13 @@ inline void libwsclient_in_data(wsclient *c, char in) {
 	}
 }
 
-void libwsclient_dispatch_message(wsclient *c, wsclient_frame *current) {
+void libwsclient_dispatch_message(__wsclient_t *c, __wsclient_frame_t *current) {
 	unsigned long long message_payload_len, message_offset;
 	int message_opcode, i;
 	char *message_payload;
-	wsclient_frame *first = NULL;
-	wsclient_message *msg = NULL;
-	wsclient_error *err = NULL;
+	__wsclient_frame_t *first = NULL;
+	__wsclient_message_t *msg = NULL;
+	__wsclient_error_t *err = NULL;
 	if(current == NULL) {
 		if(c->onerror) {
 			err = libwsclient_new_error(WS_DISPATCH_MESSAGE_NULL_PTR_ERR);
@@ -261,8 +320,8 @@ void libwsclient_dispatch_message(wsclient *c, wsclient_frame *current) {
 
 
 	libwsclient_cleanup_frames(first);
-	msg = (wsclient_message *)malloc(sizeof(wsclient_message));
-	memset(msg, 0, sizeof(wsclient_message));
+	msg = (__wsclient_message_t *)malloc(sizeof(__wsclient_message_t));
+	memset(msg, 0, sizeof(__wsclient_message_t));
 	msg->opcode = message_opcode;
 	msg->payload_len = message_offset;
 	msg->payload = message_payload;
@@ -274,9 +333,9 @@ void libwsclient_dispatch_message(wsclient *c, wsclient_frame *current) {
 	free(msg->payload);
 	free(msg);
 }
-void libwsclient_cleanup_frames(wsclient_frame *first) {
-	wsclient_frame *this = NULL;
-	wsclient_frame *next = first;
+void libwsclient_cleanup_frames(__wsclient_frame_t *first) {
+	__wsclient_frame_t *this = NULL;
+	__wsclient_frame_t *next = first;
 	while(next != NULL) {
 		this = next;
 		next = this->next_frame;
@@ -287,8 +346,8 @@ void libwsclient_cleanup_frames(wsclient_frame *first) {
 	}
 }
 
-int libwsclient_complete_frame(wsclient *c, wsclient_frame *frame) {
-	wsclient_error *err = NULL;
+int libwsclient_complete_frame(__wsclient_t *c, __wsclient_frame_t *frame) {
+	__wsclient_error_t *err = NULL;
 	int payload_len_short, i;
 	unsigned long long payload_len = 0;
 	if(frame->rawdata_idx < 2) {
@@ -369,7 +428,7 @@ int libwsclient_open_connection(const char *host, const char *port) {
 	return sockfd;
 }
 
-int libwsclient_helper_socket(wsclient *c, const char *path) {
+int libwsclient_helper_socket(__wsclient_t *c, const char *path) {
 	socklen_t len;
 	int sockfd;
 	if(c->helper_sa.sun_family) {
@@ -407,7 +466,7 @@ int libwsclient_helper_socket(wsclient *c, const char *path) {
 }
 
 void *libwsclient_helper_socket_thread(void *ptr) {
-	wsclient *c = ptr;
+	__wsclient_t *c = ptr;
 	struct sockaddr_un remote;
 	socklen_t len;
 	int remote_sock, n, n2, flags;
@@ -461,15 +520,15 @@ void *libwsclient_helper_socket_thread(void *ptr) {
 	return NULL;
 }
 
-wsclient *libwsclient_new(const char *URI) {
-	wsclient *client = NULL;
+__wsclient_t *libwsclient_new(const char *URI) {
+	__wsclient_t *client = NULL;
 
-	client = (wsclient *)malloc(sizeof(wsclient));
+	client = (__wsclient_t *)malloc(sizeof(__wsclient_t));
 	if(!client) {
 		fprintf(stderr, "Unable to allocate memory in libwsclient_new.\n");
 		exit(WS_EXIT_MALLOC);
 	}
-	memset(client, 0, sizeof(wsclient));
+	memset(client, 0, sizeof(__wsclient_t));
 	if(pthread_mutex_init(&client->lock, NULL) != 0) {
 		fprintf(stderr, "Unable to init mutex in libwsclient_new.\n");
 		exit(WS_EXIT_PTHREAD_MUTEX_INIT);
@@ -496,8 +555,8 @@ wsclient *libwsclient_new(const char *URI) {
 	return client;
 }
 void *libwsclient_handshake_thread(void *ptr) {
-	wsclient *client = (wsclient *)ptr;
-	wsclient_error *err = NULL;
+	__wsclient_t *client = (__wsclient_t *)ptr;
+	__wsclient_error_t *err = NULL;
 	const char *URI = client->URI;
 	SHA1Context shactx;
 	const char *UUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
@@ -525,12 +584,14 @@ void *libwsclient_handshake_thread(void *ptr) {
 	p = strstr(URI_copy, "://");
 	if(p == NULL) {
 		fprintf(stderr, "Malformed or missing scheme for URI.\n");
+		free(URI_copy);
 		exit(WS_EXIT_BAD_SCHEME);
 	}
 	strncpy(scheme, URI_copy, p-URI_copy);
 	scheme[p-URI_copy] = '\0';
 	if(strcmp(scheme, "ws") != 0 && strcmp(scheme, "wss") != 0) {
 		fprintf(stderr, "Invalid scheme for URI: %s\n", scheme);
+		free(URI_copy);
 		exit(WS_EXIT_BAD_SCHEME);
 	}
 	if(strcmp(scheme, "ws") == 0) {
@@ -605,7 +666,8 @@ void *libwsclient_handshake_thread(void *ptr) {
 	} else {
 		snprintf(request_host, 255, "%s", host);
 	}
-	snprintf(request_headers, 1024, "GET %s HTTP/1.1\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nHost: %s\r\nSec-WebSocket-Key: %s\r\nSec-WebSocket-Version: 13\r\n\r\n", path, request_host, websocket_key);
+	snprintf(request_headers, 1024, "GET %s HTTP/1.1\r\nHost: %s\r\nConnection: Upgrade\r\nUpgrade: websocket\r\nSec-WebSocket-Key: %s\r\nSec-WebSocket-Version: 13\r\n\r\n", path, request_host, websocket_key);
+	fprintf(stdout,"[waka] : connection request_headers : %s\n",request_headers);
 	n = _libwsclient_write(client, request_headers, strlen(request_headers));
 	z = 0;
 	memset(recv_buf, 0, 1024);
@@ -615,7 +677,7 @@ void *libwsclient_handshake_thread(void *ptr) {
 		n = _libwsclient_read(client, recv_buf + z, 1023 - z);
 		z += n;
 	} while((z < 4 || strstr(recv_buf, "\r\n\r\n") == NULL) && n > 0);
-
+	fprintf(stdout,"[waka] : connection reponse_buffer : %s\n",recv_buf);
 	if(n == 0) {
 		if(client->onerror) {
 			err = libwsclient_new_error(WS_HANDSHAKE_REMOTE_CLOSED_ERR);
@@ -666,6 +728,7 @@ void *libwsclient_handshake_thread(void *ptr) {
 					free(err);
 					err = NULL;
 				}
+				free(rcv);
 				return NULL;
 			}
 			flags |= REQUEST_VALID_STATUS;
@@ -689,6 +752,7 @@ void *libwsclient_handshake_thread(void *ptr) {
 			}
 		}
 	}
+	free(rcv);
 	if(!flags & REQUEST_HAS_UPGRADE) {
 		if(client->onerror) {
 			err = libwsclient_new_error(WS_HANDSHAKE_NO_UPGRADE_ERR);
@@ -740,15 +804,15 @@ int stricmp(const char *s1, const char *s2) {
         return c1 - c2;
 }
 
-wsclient_error *libwsclient_new_error(int errcode) {
-	wsclient_error *err = NULL;
-	err = (wsclient_error *)malloc(sizeof(wsclient_error));
+__wsclient_error_t *libwsclient_new_error(int errcode) {
+	__wsclient_error_t *err = NULL;
+	err = (__wsclient_error_t *)malloc(sizeof(__wsclient_error_t));
 	if(!err) {
 		//one of the few places we will fail and exit
 		fprintf(stderr, "Unable to allocate memory in libwsclient_new_error.\n");
 		exit(errcode);
 	}
-	memset(err, 0, sizeof(wsclient_error));
+	memset(err, 0, sizeof(__wsclient_error_t));
 	err->code = errcode;
 	switch(err->code) {
 		case WS_OPEN_CONNECTION_ADDRINFO_ERR:
@@ -813,8 +877,8 @@ wsclient_error *libwsclient_new_error(int errcode) {
 	return err;
 }
 
-int libwsclient_send_fragment(wsclient *client, char *strdata, int len, int flags) {
-	wsclient_error *err = NULL;
+int libwsclient_send_fragment(__wsclient_t *client, char *strdata, int len, int flags) {
+	__wsclient_error_t *err = NULL;
 	struct timeval tv;
 	unsigned char mask[4];
 	unsigned int mask_int;
@@ -937,8 +1001,8 @@ int libwsclient_send_fragment(wsclient *client, char *strdata, int len, int flag
 	return sent;
 }
 
-int libwsclient_send(wsclient *client, char *strdata)  {
-	wsclient_error *err = NULL;
+int libwsclient_send(__wsclient_t *client, char *strdata, int opcode)  {
+	__wsclient_error_t *err = NULL;
 	struct timeval tv;
 	unsigned char mask[4];
 	unsigned int mask_int;
@@ -988,7 +1052,11 @@ int libwsclient_send(wsclient *client, char *strdata)  {
 	mask_int = rand();
 	memcpy(mask, &mask_int, 4);
 	payload_len = strlen(strdata);
-	finNopcode = 0x81; //FIN and text opcode.
+	if(opcode==-1){
+		finNopcode = 0x81; //FIN and text opcode.
+	} else {
+		finNopcode = opcode;
+	}
 	if(payload_len <= 125) {
 		frame_size = 6 + payload_len;
 		payload_len_small = payload_len;
@@ -1057,7 +1125,7 @@ int libwsclient_send(wsclient *client, char *strdata)  {
 	return sent;
 }
 
-ssize_t _libwsclient_read(wsclient *c, void *buf, size_t length) {
+ssize_t _libwsclient_read(__wsclient_t *c, void *buf, size_t length) {
 #ifdef HAVE_LIBSSL
 	if(c->flags & CLIENT_IS_SSL) {
 		return (ssize_t)SSL_read(c->ssl, buf, length);
@@ -1069,7 +1137,7 @@ ssize_t _libwsclient_read(wsclient *c, void *buf, size_t length) {
 #endif
 }
 
-ssize_t _libwsclient_write(wsclient *c, const void *buf, size_t length) {
+ssize_t _libwsclient_write(__wsclient_t *c, const void *buf, size_t length) {
 #ifdef HAVE_LIBSSL
 	if(c->flags & CLIENT_IS_SSL) {
 		return (ssize_t)SSL_write(c->ssl, buf, length);
